@@ -1,0 +1,1096 @@
+TP Airflow — Construction d'un pipeline ETL Bitcoin avec calcul du RSI
+1. Présentation du projet
+
+L'objectif de ce TP est de construire un pipeline de données avec Apache Airflow en utilisant l'API TaskFlow.
+
+Le pipeline permet de :
+
+Récupérer les données historiques du Bitcoin.
+Stocker les données historiques dans une base PostgreSQL.
+Calculer le RSI (Relative Strength Index) sur les dix derniers jours.
+Restituer les informations du jour d'exécution.
+Éviter les appels inutiles à l'API en recherchant prioritairement les données dans PostgreSQL.
+
+Le projet met en œuvre plusieurs notions fondamentales du Data Engineering :
+
+Orchestration avec Apache Airflow.
+Développement de tâches Python avec TaskFlow API.
+Communication avec une API REST.
+Gestion des erreurs et des limitations d'API (Rate Limit).
+Persistance des données dans PostgreSQL.
+Transmission des données entre tâches avec XCom.
+Calcul d'un indicateur financier.
+2. Architecture du pipeline
+
+Le pipeline est constitué de trois tâches principales.
+
+text
+              APACHE AIRFLOW
+                    |
+                    |
+          +---------------------+
+          | extract_bitcoin_price |
+          +---------------------+
+                    |
+                    |
+             Recherche dans
+                PostgreSQL
+                    |
+          +---------+---------+
+          |                   |
+      Données présentes   Données absentes
+          |                   |
+       Lecture BDD       API CoinGecko
+                              |
+                         Données fictives
+                         si API désactivée
+                              |
+                              |
+                       Enregistrement
+                       dans PostgreSQL
+          |                   |
+          +---------+---------+
+                    |
+                  XCom
+                    |
+                    v
+          +----------------+
+          |  process_data  |
+          +----------------+
+                    |
+             Calcul du RSI
+                    |
+                  XCom
+                    |
+                    v
+          +----------------+
+          |   store_data   |
+          +----------------+
+                    |
+             Affichage logs
+
+Description des tâches
+Tâche	Fonctionnalité
+extract_bitcoin_price	Extraction des données historiques sur dix jours
+process_data	Calcul des variations et du RSI
+store_data	Restitution des résultats dans les logs
+3. Technologies utilisées
+Technologie	Utilisation
+Apache Airflow 3.1.3	Orchestration du pipeline
+Python 3.12	Développement des traitements
+Docker Compose	Environnement d'exécution
+PostgreSQL 16	Stockage des données historiques
+Redis 7.2	Broker Celery
+Requests	Communication avec l'API CoinGecko
+PostgresHook	Connexion à PostgreSQL
+TaskFlow API	Définition des tâches Airflow
+4. Configuration du pipeline
+4.1. Imports Python
+python
+from datetime import datetime, timedelta
+import logging
+import os
+import time
+
+import requests
+
+from airflow.sdk import dag, task, get_current_context
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+Explication
+datetime : manipulation des dates.
+timedelta : calcul des périodes historiques.
+logging : affichage des informations dans les logs Airflow.
+os : récupération des variables d'environnement.
+time : gestion des temps d'attente lors des appels API.
+requests : réalisation des requêtes HTTP.
+dag : déclaration d'un DAG Airflow.
+task : déclaration d'une tâche Airflow.
+get_current_context : récupération du contexte d'exécution.
+PostgresHook : communication avec PostgreSQL.
+4.2. Variables de configuration
+python
+POSTGRES_CONN_ID = "bitcoin_db"
+
+COINGECKO_USE_API = (
+    os.getenv("COINGECKO_USE_API", "false").lower() == "true"
+)
+
+COINGECKO_URL = (
+    "https://api.coingecko.com/api/v3/coins/bitcoin/history"
+)
+
+POSTGRES_CONN_ID
+
+Cette variable contient l'identifiant de la connexion PostgreSQL configurée dans Airflow.
+
+La connexion doit être créée dans Airflow sous le nom :
+
+bitcoin_db
+
+Elle permet au PostgresHook de retrouver les paramètres de connexion.
+
+COINGECKO_USE_API
+
+Cette variable permet d'activer ou de désactiver les appels à l'API CoinGecko.
+
+Par défaut, elle vaut false.
+
+Cela permet de travailler avec des données fictives sans consommer le quota de l'API.
+
+Exemple dans le fichier .env :
+
+env
+COINGECKO_USE_API=false
+
+
+Pour activer l'API :
+
+env
+COINGECKO_USE_API=true
+COINGECKO_API_KEY=VOTRE_CLE_API
+
+5. Génération des données fictives
+python
+def generate_fake_data():
+
+    prices = [
+        65000,
+        65500,
+        65200,
+        66000,
+        65800,
+        67000,
+        66800,
+        67500,
+        68000,
+        67600
+    ]
+
+    volumes = [
+        25000000000,
+        26000000000,
+        24500000000,
+        27000000000,
+        25500000000,
+        28000000000,
+        26500000000,
+        29000000000,
+        30000000000,
+        28500000000
+    ]
+
+    return prices, volumes
+
+
+Cette fonction génère deux listes :
+
+prices : les prix fictifs du Bitcoin.
+volumes : les volumes fictifs échangés.
+
+Chaque indice correspond à une journée.
+
+Nous disposons donc de dix journées de données.
+
+L'utilisation de données fictives permet de tester le pipeline sans dépendre de l'API CoinGecko.
+
+6. Gestion du Rate Limit CoinGecko
+6.1. Pourquoi gérer le Rate Limit ?
+
+Les API publiques imposent généralement une limitation du nombre de requêtes.
+
+Lorsque cette limite est dépassée, le serveur peut retourner le code HTTP :
+
+429 Too Many Requests
+
+Notre pipeline doit donc être capable de gérer cette situation.
+
+6.2. Fonction fetch_coingecko_data()
+python
+def fetch_coingecko_data(date):
+
+    api_key = os.getenv("COINGECKO_API_KEY")
+
+    headers = {}
+
+    if api_key:
+        headers["x-cg-demo-api-key"] = api_key
+
+    params = {
+        "date": date.strftime("%d-%m-%Y"),
+        "localization": "false"
+    }
+
+    max_attempts = 5
+
+    for attempt in range(max_attempts):
+
+        response = requests.get(
+            COINGECKO_URL,
+            params=params,
+            headers=headers,
+            timeout=30
+        )
+
+        if response.status_code == 429:
+
+            retry_after = response.headers.get("Retry-After")
+
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 2 ** attempt
+
+            if attempt == max_attempts - 1:
+                response.raise_for_status()
+
+            logging.warning(
+                f"Rate limit atteint. Nouvelle tentative "
+                f"dans {delay} secondes."
+            )
+
+            time.sleep(min(delay, 60))
+            continue
+
+        if response.status_code >= 500:
+
+            if attempt == max_attempts - 1:
+                response.raise_for_status()
+
+            delay = 2 ** attempt
+
+            logging.warning(
+                f"Erreur serveur CoinGecko. "
+                f"Nouvelle tentative dans {delay} secondes."
+            )
+
+            time.sleep(delay)
+            continue
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        market_data = data["market_data"]
+
+        return {
+            "usd": market_data["current_price"]["usd"],
+            "volume": market_data["total_volume"]["usd"]
+        }
+
+    raise Exception("Impossible de récupérer les données CoinGecko")
+
+Explication
+
+La fonction réalise plusieurs opérations :
+
+Récupération de la clé API.
+Préparation des paramètres HTTP.
+Envoi de la requête GET.
+Vérification du code HTTP.
+Gestion des erreurs 429.
+Gestion des erreurs serveur 500 et supérieures.
+Extraction du prix et du volume.
+Retour des données sous forme de dictionnaire.
+Gestion des tentatives
+python
+max_attempts = 5
+
+
+Nous autorisons cinq tentatives.
+
+Gestion du délai
+python
+delay = 2 ** attempt
+
+
+Nous utilisons un mécanisme de backoff exponentiel.
+
+Les délais théoriques sont :
+
+Tentative	Délai
+1	1 seconde
+2	2 secondes
+3	4 secondes
+4	8 secondes
+5	16 secondes
+
+Lorsque le serveur fournit un en-tête Retry-After, celui-ci est privilégié.
+
+7. Définition du DAG
+python
+@dag(
+    dag_id="bitcoin_rsi_pipeline",
+    description="Pipeline ETL Bitcoin avec calcul RSI et PostgreSQL",
+    start_date=datetime(2025, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["ETL", "Bitcoin", "RSI", "PostgreSQL"]
+)
+
+def bitcoin_rsi_pipeline():
+
+Explication des paramètres
+Paramètre	Description
+dag_id	Identifiant unique du DAG
+description	Description du workflow
+start_date	Date de début du DAG
+schedule	Fréquence d'exécution
+catchup	Activation ou non des exécutions historiques
+tags	Catégories permettant de retrouver le DAG
+
+schedule=None signifie que le DAG ne possède pas de programmation automatique.
+
+Il faudra donc déclencher manuellement les exécutions depuis Airflow.
+
+8. TASK 1 : Extraction des données historiques
+8.1. Récupération du contexte Airflow
+python
+@task
+def extract_bitcoin_price():
+
+    context = get_current_context()
+
+    execution_date = context["logical_date"].date()
+
+
+get_current_context() permet de récupérer les informations relatives à l'exécution courante.
+
+Nous récupérons ensuite :
+
+logical_date
+
+Cette date représente la date logique du DAG Run.
+
+Attention : elle ne correspond pas nécessairement à l'heure réelle de lancement.
+
+8.2. Calcul des dix journées historiques
+python
+start_date = execution_date - timedelta(days=9)
+
+dates = [
+    start_date + timedelta(days=i)
+    for i in range(10)
+]
+
+
+Nous calculons la date de départ en retirant neuf jours à la date d'exécution.
+
+Nous construisons ensuite une liste de dix dates.
+
+Exemple :
+
+Si la date d'exécution est le 06/11/2026 :
+
+Indice	Date
+0	28/10/2026
+1	29/10/2026
+2	30/10/2026
+3	31/10/2026
+4	01/11/2026
+5	02/11/2026
+6	03/11/2026
+7	04/11/2026
+8	05/11/2026
+9	06/11/2026
+
+Nous obtenons bien dix journées.
+
+8.3. Connexion PostgreSQL
+python
+pg_hook = PostgresHook(
+    postgres_conn_id=POSTGRES_CONN_ID
+)
+
+
+Nous instancions un objet PostgresHook.
+
+Il utilise la connexion Airflow identifiée par :
+
+bitcoin_db
+
+Cette connexion contient les informations nécessaires pour accéder à PostgreSQL.
+
+8.4. Création de la table historique
+python
+pg_hook.run("""
+    CREATE TABLE IF NOT EXISTS bitcoin_market_history (
+        market_date DATE PRIMARY KEY,
+        price_usd NUMERIC(20, 8) NOT NULL,
+        volume_usd NUMERIC(30, 8) NOT NULL
+    );
+""")
+
+
+Cette instruction crée la table si elle n'existe pas.
+
+Structure de la table
+Colonne	Type	Description
+market_date	DATE	Date des données
+price_usd	NUMERIC(20,8)	Prix du Bitcoin
+volume_usd	NUMERIC(30,8)	Volume échangé
+
+La colonne market_date constitue la clé primaire.
+
+Elle garantit l'unicité de chaque journée.
+
+IF NOT EXISTS permet de ne pas recréer la table à chaque exécution.
+
+8.5. Lecture prioritaire des données PostgreSQL
+python
+cached_data = pg_hook.get_records(
+    """
+    SELECT market_date, price_usd, volume_usd
+    FROM bitcoin_market_history
+    WHERE market_date BETWEEN %s AND %s
+    ORDER BY market_date
+    """,
+    parameters=(start_date, execution_date)
+)
+
+
+Cette requête récupère les données historiques comprises entre les deux dates.
+
+get_records() permet d'exécuter une requête SELECT et de récupérer les résultats.
+
+Les paramètres sont transmis séparément de la requête SQL.
+
+Cela permet notamment d'éviter de construire manuellement une requête avec des valeurs dynamiques.
+
+8.6. Construction du cache Python
+python
+cache = {}
+
+for row in cached_data:
+
+    cache[row[0].isoformat()] = {
+        "date": row[0].isoformat(),
+        "usd": float(row[1]),
+        "volume": float(row[2])
+    }
+
+
+Nous transformons les résultats PostgreSQL en dictionnaire Python.
+
+Exemple :
+
+python
+cache = {
+    "2026-11-05": {
+        "date": "2026-11-05",
+        "usd": 68000,
+        "volume": 30000000000
+    }
+}
+
+
+Cela facilite la recherche des journées déjà présentes dans la base.
+
+La date est utilisée comme clé du dictionnaire.
+
+8.7. Identification des données manquantes
+python
+for index, current_date in enumerate(dates):
+
+    date_key = current_date.isoformat()
+
+    if date_key in cache:
+
+        record = cache[date_key]
+
+    else:
+
+
+Nous parcourons les dix journées.
+
+Pour chaque date :
+
+Si elle existe dans PostgreSQL, nous récupérons les données existantes.
+Sinon, nous devons récupérer ou générer les données.
+
+Cette logique évite de solliciter inutilement l'API.
+
+8.8. Récupération des données
+python
+if COINGECKO_USE_API:
+
+    market_data = fetch_coingecko_data(current_date)
+
+else:
+
+    market_data = {
+        "usd": fake_prices[index],
+        "volume": fake_volumes[index]
+    }
+
+
+Deux possibilités :
+
+Mode API
+
+Nous interrogeons CoinGecko.
+
+Mode simulation
+
+Nous utilisons les données fictives.
+
+Cette approche permet de développer et tester le pipeline sans dépendre d'une API externe.
+
+8.9. Enregistrement dans PostgreSQL
+python
+pg_hook.run(
+    """
+    INSERT INTO bitcoin_market_history
+    (market_date, price_usd, volume_usd)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (market_date)
+    DO UPDATE SET
+        price_usd = EXCLUDED.price_usd,
+        volume_usd = EXCLUDED.volume_usd
+    """,
+    parameters=(
+        current_date,
+        record["usd"],
+        record["volume"]
+    )
+)
+
+
+Cette requête réalise un UPSERT.
+
+Un UPSERT combine deux opérations :
+
+INSERT : insertion d'une nouvelle ligne.
+UPDATE : mise à jour d'une ligne existante.
+Comprendre ON CONFLICT
+
+La clause :
+
+sql
+ON CONFLICT (market_date)
+
+
+indique que nous souhaitons gérer les conflits sur la clé primaire.
+
+Si la date existe déjà :
+
+sql
+DO UPDATE SET
+    price_usd = EXCLUDED.price_usd,
+    volume_usd = EXCLUDED.volume_usd
+
+
+PostgreSQL met à jour les valeurs.
+
+EXCLUDED représente les nouvelles valeurs que nous souhaitions insérer.
+
+Cette fonctionnalité permet de rendre le traitement plus facilement relançable.
+
+8.10. Transmission des données via XCom
+python
+historical_data.append(record)
+
+return historical_data
+
+
+Nous ajoutons chaque journée à la liste.
+
+À la fin de la boucle, nous retournons les dix journées.
+
+Avec TaskFlow API, Airflow stocke automatiquement le résultat dans XCom.
+
+La tâche suivante pourra récupérer ces données directement en paramètre.
+
+9. TASK 2 : Transformation et calcul du RSI
+9.1. Réception des données
+python
+@task
+def process_data(historical_data):
+
+
+Cette tâche reçoit les données retournées par extract_bitcoin_price.
+
+Airflow transmet automatiquement le résultat grâce à XCom.
+
+9.2. Vérification du nombre de journées
+python
+if len(historical_data) != 10:
+    raise ValueError(
+        "Le calcul du RSI nécessite 10 prix historiques."
+    )
+
+
+Nous vérifions que nous disposons de dix journées.
+
+Dix prix permettent de calculer neuf variations quotidiennes.
+
+9.3. Extraction des prix
+python
+prices = [
+    item["usd"]
+    for item in historical_data
+]
+
+
+Nous utilisons une liste en compréhension.
+
+Elle permet d'extraire uniquement les prix du Bitcoin.
+
+Exemple :
+
+python
+prices = [
+    65000,
+    65500,
+    65200,
+    66000
+]
+
+9.4. Initialisation des gains et pertes
+python
+gains = []
+losses = []
+
+
+Nous créons deux listes :
+
+gains : variations positives.
+losses : variations négatives exprimées en valeurs positives.
+9.5. Calcul des variations quotidiennes
+python
+for i in range(1, len(prices)):
+
+    variation = prices[i] - prices[i - 1]
+
+
+Nous comparons chaque prix avec celui de la journée précédente.
+
+Exemple :
+
+text
+65500 - 65000 = +500
+65200 - 65500 = -300
+66000 - 65200 = +800
+
+
+Nous obtenons neuf variations.
+
+9.6. Séparation des gains et pertes
+python
+if variation > 0:
+    gains.append(variation)
+    losses.append(0)
+
+else:
+    gains.append(0)
+    losses.append(abs(variation))
+
+
+Si la variation est positive, elle est enregistrée dans gains.
+
+Si elle est négative, sa valeur absolue est enregistrée dans losses.
+
+Exemple :
+
+python
+variations = [500, -300, 800, -200]
+
+
+Résultat :
+
+python
+gains = [500, 0, 800, 0]
+
+losses = [0, 300, 0, 200]
+
+9.7. Calcul des moyennes
+python
+average_gain = sum(gains) / len(gains)
+
+average_loss = sum(losses) / len(losses)
+
+
+Nous calculons la moyenne des gains et la moyenne des pertes sur les neuf variations.
+
+Exemple :
+
+python
+gains = [500, 0, 800, 0]
+
+
+La moyenne est :
+
+text
+(500 + 0 + 800 + 0) / 4 = 325
+
+9.8. Calcul du RSI
+
+La formule utilisée est :
+
+RSI=100−1001+RS
+
+Avec :
+
+RS=Gain moyenPerte moyenne
+
+Implémentation :
+
+python
+if average_gain == 0 and average_loss == 0:
+
+    rsi = 50.0
+
+elif average_loss == 0:
+
+    rsi = 100.0
+
+elif average_gain == 0:
+
+    rsi = 0.0
+
+else:
+
+    rs = average_gain / average_loss
+
+    rsi = 100 - (100 / (1 + rs))
+
+
+Les différents cas permettent de gérer les situations où les gains ou les pertes sont nuls.
+
+9.9. Arrondi du RSI
+python
+rsi = round(rsi, 2)
+
+
+Nous conservons deux décimales.
+
+9.10. Construction du résultat
+python
+current_data = historical_data[-1]
+
+processed_data = {
+    "date": current_data["date"],
+    "usd": current_data["usd"],
+    "volume": current_data["volume"],
+    "rsi": rsi
+}
+
+
+Nous récupérons le dernier élément de la liste.
+
+Comme les données sont triées chronologiquement, il correspond à la date d'exécution.
+
+Nous construisons ensuite un dictionnaire contenant :
+
+La date.
+Le prix USD.
+Le volume USD.
+Le RSI.
+
+Exemple :
+
+python
+{
+    "date": "2026-11-06",
+    "usd": 67600,
+    "volume": 28500000000,
+    "rsi": 77.08
+}
+
+
+Enfin :
+
+python
+return processed_data
+
+
+Le résultat est transmis automatiquement à la tâche suivante via XCom.
+
+10. TASK 3 : Restitution des résultats
+python
+@task
+def store_data(processed_data):
+
+    logging.info("====================================")
+
+    logging.info("BITCOIN HISTORICAL MARKET DATA")
+
+    logging.info(f"Date : {processed_data['date']}")
+
+    logging.info(f"Prix USD : {processed_data['usd']}")
+
+    logging.info(f"Volume USD : {processed_data['volume']}")
+
+    logging.info(f"RSI : {processed_data['rsi']}")
+
+    logging.info("====================================")
+
+
+Cette tâche reçoit le dictionnaire retourné par process_data.
+
+Elle affiche les informations dans les logs Airflow.
+
+Exemple :
+
+text
+====================================
+BITCOIN HISTORICAL MARKET DATA
+====================================
+Date : 2026-11-06
+Prix USD : 67600.0
+Volume USD : 28500000000.0
+RSI : 77.08
+====================================
+
+
+Attention : cette tâche ne réalise pas d'insertion dans PostgreSQL.
+
+Elle sert uniquement à restituer les résultats dans les logs.
+
+11. Orchestration du workflow
+python
+historical_data = extract_bitcoin_price()
+
+processed_data = process_data(historical_data)
+
+store_data(processed_data)
+
+
+Ces trois instructions définissent l'enchaînement des tâches.
+
+Grâce à TaskFlow API, les dépendances sont automatiquement créées.
+
+text
+extract_bitcoin_price
+          |
+          | XCom
+          v
+     process_data
+          |
+          | XCom
+          v
+       store_data
+
+
+Il n'est donc pas nécessaire d'utiliser explicitement :
+
+python
+extract_bitcoin_price() >> process_data()
+
+
+Le passage des paramètres suffit à définir les dépendances.
+
+Enfin, nous instancions le DAG :
+
+python
+bitcoin_rsi_pipeline()
+
+
+Cette instruction permet à Airflow de découvrir le workflow.
+
+12. Comprendre XCom
+
+XCom signifie Cross Communication.
+
+C'est le mécanisme utilisé par Airflow pour transmettre des informations entre les tâches.
+
+Dans notre pipeline :
+
+python
+historical_data = extract_bitcoin_price()
+
+
+La première tâche retourne une liste de dix journées.
+
+Airflow enregistre automatiquement ce résultat dans XCom.
+
+Ensuite :
+
+python
+processed_data = process_data(historical_data)
+
+
+La deuxième tâche récupère le résultat de la première.
+
+Enfin :
+
+python
+store_data(processed_data)
+
+
+La troisième tâche récupère le résultat de la deuxième.
+
+Avec TaskFlow API, nous n'avons donc pas besoin d'utiliser manuellement :
+
+python
+ti.xcom_push()
+
+
+ou :
+
+python
+ti.xcom_pull()
+
+
+Bonne pratique : XCom est adapté aux petits résultats et aux métadonnées. Il est préférable de stocker les volumes importants dans une base de données ou un stockage dédié et de transmettre uniquement les références via XCom.
+
+13. Vérification dans PostgreSQL
+
+Pour accéder à PostgreSQL depuis le terminal :
+
+bash
+docker compose exec postgres psql -U airflow -d airflow
+
+
+Explication :
+
+Élément	Signification
+docker compose	Utilisation de Docker Compose
+exec	Exécution d'une commande dans un conteneur existant
+postgres	Nom du service PostgreSQL
+psql	Client en ligne de commande PostgreSQL
+-U airflow	Utilisateur PostgreSQL
+-d airflow	Base de données
+
+Pour consulter les tables :
+
+sql
+\dt
+
+
+Pour consulter la structure de la table :
+
+sql
+\d bitcoin_market_history
+
+
+Pour afficher les données historiques :
+
+sql
+SELECT *
+FROM bitcoin_market_history
+ORDER BY market_date;
+
+
+Pour compter les journées enregistrées :
+
+sql
+SELECT COUNT(*)
+FROM bitcoin_market_history;
+
+
+Pour afficher les dix dernières journées :
+
+sql
+SELECT *
+FROM bitcoin_market_history
+ORDER BY market_date DESC
+LIMIT 10;
+
+
+Pour quitter PostgreSQL :
+
+sql
+\q
+
+14. Points d'amélioration
+
+Le pipeline répond aux objectifs pédagogiques du TP, mais plusieurs améliorations peuvent être envisagées.
+
+14.1. Distinguer les données fictives des données réelles
+
+Actuellement, les données fictives et les données CoinGecko sont enregistrées dans la même table.
+
+Il serait intéressant d'ajouter une colonne :
+
+sql
+ALTER TABLE bitcoin_market_history
+ADD COLUMN source VARCHAR(20);
+
+
+Elle pourrait contenir :
+
+FAKE
+COINGECKO
+
+Cela permettrait de connaître l'origine des données.
+
+Attention : le code d'insertion devrait également être adapté pour renseigner cette colonne.
+
+14.2. Stocker le RSI dans PostgreSQL
+
+Actuellement, le RSI est uniquement affiché dans les logs.
+
+Nous pourrions créer une deuxième table :
+
+sql
+CREATE TABLE bitcoin_rsi (
+    calculation_date DATE PRIMARY KEY,
+    price_usd NUMERIC(20, 8),
+    volume_usd NUMERIC(30, 8),
+    rsi NUMERIC(10, 2)
+);
+
+
+La tâche store_data pourrait alors enregistrer le résultat du calcul.
+
+14.3. Améliorer la gestion du Rate Limit
+
+La fonction utilise actuellement :
+
+python
+time.sleep()
+
+
+Cette méthode fonctionne, mais elle immobilise le processus de travail pendant l'attente.
+
+Une autre approche consiste à utiliser les mécanismes natifs d'Airflow :
+
+retries
+retry_delay
+retry_exponential_backoff
+
+Cela permet de confier la gestion des nouvelles tentatives à Airflow.
+
+14.4. Améliorer le calcul du RSI
+
+Le calcul actuel utilise une moyenne arithmétique des gains et pertes sur neuf variations.
+
+La méthode classique de Wilder utilise un lissage particulier.
+
+Il serait intéressant d'implémenter cette méthode pour obtenir un RSI conforme à l'indicateur financier traditionnel.
+
+15. Synthèse des notions à retenir
+N°	Notion	Objectif
+1	@dag	Déclarer un workflow
+2	@task	Déclarer une tâche Python
+3	get_current_context()	Récupérer le contexte Airflow
+4	timedelta	Calculer une période historique
+5	requests.get()	Interroger une API REST
+6	PostgresHook	Se connecter à PostgreSQL
+7	get_records()	Lire des données SQL
+8	pg_hook.run()	Exécuter des commandes SQL
+9	ON CONFLICT	Gérer les doublons
+10	XCom	Transmettre les résultats entre tâches
+11	Rate Limit	Gérer les limitations d'une API
+12	RSI	Calculer un indicateur financier
+16. Conclusion
+
+Ce TP permet de mettre en œuvre les principaux mécanismes nécessaires à la construction d'un pipeline ETL avec Apache Airflow.
+
+Nous avons construit un workflow capable de :
+
+Extraire des données depuis une API REST.
+Utiliser un jeu de données fictif pour les tests.
+Gérer les limitations d'une API externe.
+Stocker les données historiques dans PostgreSQL.
+Éviter les appels inutiles grâce à un mécanisme de cache.
+Transmettre les résultats entre tâches avec XCom.
+Transformer les données et calculer un indicateur métier.
+Orchestrer automatiquement les différentes étapes du traitement.
+
+L'architecture obtenue constitue une première approche d'un pipeline Data Engineering.
+
+Elle pourra être enrichie progressivement avec des mécanismes de supervision, de qualité des données, de stockage analytique et de gestion des erreurs.
+
+L'objectif principal est de comprendre qu'un pipeline ETL ne consiste pas uniquement à exécuter du code Python : il s'agit d'organiser, de fiabiliser et de tracer un ensemble de traitements sur des données.
